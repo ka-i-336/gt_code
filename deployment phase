@@ -1,0 +1,346 @@
+import os
+import numpy as np
+import tensorflow as tf
+import streamlit as st
+from streamlit_drawable_canvas import st_canvas
+import pandas as pd
+from io import BytesIO
+from PIL import Image
+from rdp import rdp
+from pathlib import Path
+
+MODEL_FILE_NAME = "./qd_apparel_acc99_18_eps1_5.keras"
+BASE_DIR = Path(__file__).resolve().parent
+
+# Streamlitキャッシュ
+@st.cache_resource
+def get_model(path):
+    return tf.keras.models.load_model(path, compile=False)
+
+model = get_model(MODEL_FILE_NAME)
+
+#出力画像
+class_names = ["straight","skinny","wide","frea","jogger","shirt","long_t","jacket","coat","hoodie"]
+class_image = {
+    "straight": BASE_DIR / "straight_ex_img.jpg",
+    "skinny":   BASE_DIR / "skinny_ex_img.jpg",
+    "wide":     BASE_DIR / "wide_ex_img.png",
+    "frea":     BASE_DIR / "frea_ex_img.jpg",
+    "jogger":   BASE_DIR / "jogger_ex_img.jpg",
+    "shirt":    BASE_DIR / "shirt_ex_img.png",
+    "long_t":   BASE_DIR / "long_t_ex_img.png",
+    "hoodie":   BASE_DIR / "hoodie_ex_img.png",
+    "jacket":   BASE_DIR / "jacket_ex_img.jpg",
+    "coat":     BASE_DIR / "coat_ex_img.png",
+}
+
+@st.cache_data
+def get_class_image(label: str):
+    p = class_image.get(label)
+    if p is None or (not p.exists()):
+        return None
+    return Image.open(p)
+
+
+
+MAXLEN = 100
+
+def extract_xy_strokes_from_objects(objects):
+
+    strokes = []
+
+    for obj in objects:
+        path = obj.get("path", [])
+        current_stroke = []
+
+        for point in path:
+            if isinstance(point, list) and len(point) >= 3:
+                cmd = point[0]
+
+                if cmd in ["M", "L"] and len(point) >= 3:
+                    x = float(point[1])
+                    y = float(point[2])
+                    current_stroke.append([x, y])
+
+                elif cmd == "Q" and len(point) >= 5:
+                    x = float(point[3])
+                    y = float(point[4])
+                    current_stroke.append([x, y])
+
+            elif isinstance(point, dict):
+                x = point.get("x")
+                y = point.get("y")
+                if x is not None and y is not None:
+                    current_stroke.append([float(x), float(y)])
+
+        if current_stroke:
+            strokes.append(current_stroke)
+
+    #st.subheader("デバッグ：抽出された (x, y) 座標")
+    #if len(strokes) == 0:
+    #   st.warning("座標が1つも取得できていません")
+    #else:
+    #    st.write(f"ストローク数: {len(strokes)}")
+    #    preview = strokes[0][:10] if len(strokes[0]) > 0 else []
+    #    st.write("最初のストロークから10点:", preview)
+    return strokes
+
+
+def points_to_xy(strokes_pts):
+    xy_strokes = []
+    for stroke in strokes_pts:
+        if not stroke:
+            continue
+
+        x_list, y_list = [], []
+        for point in stroke: 
+            x = float(point[0])
+            y = float(point[1])
+            x_list.append(x)
+            y_list.append(y)
+        xy_strokes.append([x_list, y_list])
+    return xy_strokes
+
+
+def simplified(strokes):
+    x_list = []
+    y_list = []
+    for stroke in strokes:
+        x_list += stroke[0]
+        y_list += stroke[1]
+
+    min_x, min_y = min(x_list), min(y_list)
+    max_x, max_y = max(x_list), max(y_list)
+    w = max_x - min_x
+    h = max_y - min_y
+    s = max(w, h)
+    scale = 255.0 / s 
+
+
+    out = []
+    for stroke in strokes:
+        x_norm = []
+        y_norm = []
+
+        for i in range(len(stroke[0])):
+            x = (stroke[0][i] - min_x) * scale
+            y = (stroke[1][i] - min_y) * scale
+            x_norm.append(x)
+            y_norm.append(y)
+        out.append([x_norm, y_norm])
+
+    return out
+
+#eps1,max110 eps1.5,max100 eps2,max100
+def rdp_simplify_strokes(xy_strokes, eps=1.5, min_keep=10):
+    out = []
+    for x_list, y_list in xy_strokes:
+        n = len(x_list)
+        if n <= min_keep:
+            out.append([x_list, y_list])
+            continue
+
+        pts = np.stack([x_list, y_list], axis=1).astype(np.float32)
+        reduced = np.array(rdp(pts, epsilon=eps), dtype=np.float32)
+
+        if len(reduced) < min_keep:
+            out.append([x_list, y_list])
+        else:
+            out.append([reduced[:, 0].tolist(), reduced[:, 1].tolist()])
+    return out
+
+
+def convert_strokes_to_seq(strokes):
+    seq_5d = []
+    prev_x, prev_y = 0, 0
+
+    for stroke in strokes:
+        x_list, y_list = stroke[0], stroke[1]
+
+        for i in range(len(x_list)):
+            x, y = x_list[i], y_list[i]
+            dx, dy = x - prev_x, y - prev_y
+
+            pen = [1, 0, 0]  
+            if i == len(x_list) - 1:
+                pen = [0, 1, 0]  
+
+            seq_5d.append([dx, dy] + pen)
+            prev_x, prev_y = x, y
+
+    seq_5d.append([0, 0, 0, 0, 1])
+    return seq_5d
+
+
+def preprocess_strokes(raw_strokes, maxlen=MAXLEN):
+    xy = points_to_xy(raw_strokes)
+    xy_sim = simplified(xy)
+    xy_rdp = rdp_simplify_strokes(xy_sim,eps=1.5)
+    seq_5d = convert_strokes_to_seq(xy_rdp)
+
+    if len(seq_5d) < maxlen:
+        seq_5d += [[0.0] * 5] * (maxlen - len(seq_5d))
+    else:
+        seq_5d = seq_5d[:maxlen]
+
+    x = np.array(seq_5d, dtype=np.float32)
+    x = np.expand_dims(x, axis=0)
+    return x
+
+def classify_strokes(js_strokes):
+    if not js_strokes or not js_strokes[0]:
+        return None, 0.0, "スケッチしてください", None
+
+    x = preprocess_strokes(js_strokes, maxlen=MAXLEN)
+    pred = model.predict(x, verbose=0)[0]
+
+    results = []
+    for i, confidence in enumerate(pred):
+        results.append({
+            "label": class_names[i],
+            "confidence": float(confidence)
+        })
+
+    results.sort(key = lambda x: x["confidence"], reverse = True)
+
+    top3_results = results[:3]
+    label = results[0]["label"]
+    confidence = results[0]["confidence"]
+    top_result = f"判定: {label} 精度: {confidence:.1%}"
+
+    return label, confidence, top_result, top3_results
+
+
+# UI
+st.set_page_config(page_title="Silhouette Classifier", layout="wide")
+
+st.markdown(
+    "<h1 style='margin-bottom:8px;'>Silhouette Classifier</h1>",
+    unsafe_allow_html=True
+)
+
+# UI
+#st.title("Silhouette Classifier")
+st.caption("Draw a silhouette on the canvas.")
+
+left_col, right_col = st.columns([6, 4], gap="large")
+
+with left_col:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Sketch</div>', unsafe_allow_html=True)
+
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 165, 0, 0)",
+        stroke_width=6,
+        stroke_color="#000000",
+        background_color="#FFFFFF",
+        height=500,
+        width=500,
+        drawing_mode="freedraw",
+        key="canvas_app",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with right_col:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Predictions</div>', unsafe_allow_html=True)
+
+    if canvas_result.json_data is not None:
+        objects = canvas_result.json_data.get("objects", [])
+        raw_strokes = extract_xy_strokes_from_objects(objects)
+
+        if raw_strokes:
+            label, confidence, top_text, top3_results = classify_strokes(raw_strokes)
+
+            top1 = top3_results[0]
+            img1 = get_class_image(top1["label"])
+            if img1 is not None:
+                st.image(img1, use_container_width=True)
+            else:
+                st.info("(image not found)")
+
+            st.markdown(f"**{top1['label']}**")
+            st.markdown(f'<div class="mini">{top1["confidence"]*100:.1f}%</div>', unsafe_allow_html=True)
+
+            st.markdown("<hr>", unsafe_allow_html=True)
+
+            c2, c3 = st.columns(2, gap="medium")
+
+            r2 = top3_results[1]
+            r3 = top3_results[2]
+
+            with c2:
+                img2 = get_class_image(r2["label"])
+                if img2 is not None:
+                    st.image(img2, use_container_width=True)
+                else:
+                    st.info("(image not found)")
+                st.markdown(f"**#2 {r2['label']}**")
+                st.markdown(f'<div class="mini">{r2["confidence"]*100:.1f}%</div>', unsafe_allow_html=True)
+
+            with c3:
+                img3 = get_class_image(r3["label"])
+                if img3 is not None:
+                    st.image(img3, use_container_width=True)
+                else:
+                    st.info("(image not found)")
+                st.markdown(f"**#3 {r3['label']}**")
+                st.markdown(f'<div class="mini">{r3["confidence"]*100:.1f}%</div>', unsafe_allow_html=True)
+
+            st.markdown("<hr>", unsafe_allow_html=True)
+
+            st.subheader("Top-3 (table)")
+            df_results = pd.DataFrame(top3_results)
+            df_results["confidence"] = df_results["confidence"].map(lambda v: f"{v*100:.1f}%")
+            st.dataframe(df_results, use_container_width=True, hide_index=True)
+
+        else:
+            st.info("Draw on the canvas to see predictions.")
+    else:
+        st.info("Canvas is initializing...")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ダウンロード
+if canvas_result.json_data is not None:
+    objects = canvas_result.json_data.get("objects", [])
+    raw_strokes = extract_xy_strokes_from_objects(objects)
+
+    if raw_strokes:
+        label, confidence, top_text, top3_results = classify_strokes(raw_strokes)
+
+        if canvas_result.image_data is not None:
+            img_array = canvas_result.image_data.astype(np.uint8)
+            img = Image.fromarray(img_array)
+
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            img_bytes = buf.getvalue()
+
+            filename = f"{label}_{confidence*100:.0f}pc_{os.urandom(4).hex()}.png"
+
+            st.download_button(
+                label="Save sketch (PNG)",
+                data=img_bytes,
+                file_name=filename,
+                mime="image/png"
+            )
+
+        # (CSV)
+        df_results = pd.DataFrame(top3_results)
+        df_results["confidence"] = df_results["confidence"].map("{:.6f}".format)
+
+        csv_buf = BytesIO()
+        df_results.to_csv(csv_buf, index=False, encoding="utf-8-sig")
+        csv_buf.seek(0)
+
+        csv_filename = f"results_{os.urandom(4).hex()}.csv"
+        st.download_button(
+            label="Save results (CSV)",
+            data=csv_buf,
+            file_name=csv_filename,
+            mime="text/csv"
+        )
+
+
+
